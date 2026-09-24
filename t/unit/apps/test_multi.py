@@ -7,7 +7,14 @@ from unittest.mock import Mock, call, patch
 import pytest
 
 import t.skip
-from celery.apps.multi import Cluster, MultiParser, NamespacedOptionParser, Node, format_opt
+from celery.apps.multi import (
+    Cluster,
+    MultiParser,
+    NamespacedOptionParser,
+    Node,
+    build_nodename,
+    format_opt,
+)
 
 
 class test_functions:
@@ -24,6 +31,35 @@ class test_functions:
         assert format_opt('--foo', None) == '--foo'
         assert format_opt('-c', 1) == '-c 1'
         assert format_opt('--log', 'foo') == '--log=foo'
+
+
+class test_build_nodename:
+
+    def test_name_with_literal_percent(self):
+        assert build_nodename('foo%bar', 'celery', 'example.com') == (
+            'foo%bar', 'celeryfoo%bar@example.com', 'example.com')
+
+    def test_qualified_name_with_literal_percent(self):
+        assert build_nodename('foo%bar@example.com', 'celery', 'example.com') == (
+            'foo%bar', 'foo%bar@example.com', 'example.com')
+
+    def test_name_with_trailing_percent(self):
+        assert build_nodename('100%', 'celery', 'example.com') == (
+            '100%', 'celery100%@example.com', 'example.com')
+
+    def test_name_with_multiple_percents(self):
+        assert build_nodename('a%b%c@example.com', 'celery', 'example.com') == (
+            'a%b%c', 'a%b%c@example.com', 'example.com')
+
+    def test_name_with_escaped_percent(self):
+        assert build_nodename('foo%%bar@example.com', 'celery', 'example.com') == (
+            'foo%%bar', 'foo%%bar@example.com', 'example.com')
+
+    @patch('celery.utils.nodenames.gethostname')
+    def test_hostname_abbreviation_still_expanded(self, gethostname):
+        gethostname.return_value = 'example.com'
+        assert build_nodename('foo@%h', 'celery', 'example.com') == (
+            'foo', 'foo@example.com', 'example.com')
 
 
 class test_NamespacedOptionParser:
@@ -174,6 +210,35 @@ class test_multi_args:
         assert nodes[0].name == 'worker-1@'
         assert '-c 5' in nodes[0].argv
 
+    def test_parse__name_with_percent(self, tmp_path):
+        p = NamespacedOptionParser([
+            'foo%bar@example.com',
+            f'--pidfile={tmp_path}/%n.pid',
+            f'--logfile={tmp_path}/%n.log',
+        ])
+        p.parse()
+        nodes = list(multi_args(p, cmd='celery multi'))
+        assert len(nodes) == 1
+        node = nodes[0]
+        assert node.name == 'foo%bar@example.com'
+        assert '-n foo%bar@example.com' in node.argv
+        assert f'--pidfile={tmp_path}/foo%bar.pid' in node.argv
+        assert f'--logfile={tmp_path}/foo%bar.log' in node.argv
+
+    def test_parse__unqualified_name_with_percent(self, tmp_path):
+        p = NamespacedOptionParser([
+            'foo%bar',
+            f'--pidfile={tmp_path}/%n.pid',
+            f'--logfile={tmp_path}/%n.log',
+        ])
+        p.parse()
+        nodes = list(multi_args(p, cmd='celery multi', suffix='example.com'))
+        assert len(nodes) == 1
+        node = nodes[0]
+        assert node.name == 'foo%bar@example.com'
+        assert '-n foo%bar@example.com' in node.argv
+        assert f'--pidfile={tmp_path}/foo%bar.pid' in node.argv
+
     def test_optmerge(self):
         p = NamespacedOptionParser(['foo', 'test'])
         p.parse()
@@ -213,6 +278,16 @@ class test_Node:
             '--pidfile={}'.format(os.path.normpath('/var/run/celery/foo.pid')),
             '',
         ])
+
+    def test_nodename_with_percent_is_not_reexpanded(self, tmp_path):
+        node = Node('foo%bar@bar.com', options={
+            '--pidfile': f'{tmp_path}/%n.pid',
+            '--logfile': f'{tmp_path}/%n%I.log',
+        })
+        assert '-n foo%bar@bar.com' in node.argv
+        assert node.pidfile == f'{tmp_path}/foo%bar.pid'
+        # %I is left for the worker process itself to expand.
+        assert node.logfile == f'{tmp_path}/foo%bar%I.log'
 
     @patch('os.kill')
     def test_send(self, kill):

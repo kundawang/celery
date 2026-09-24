@@ -1,6 +1,7 @@
 """Start/stop/manage workers."""
 import errno
 import os
+import re
 import shlex
 import signal
 import sys
@@ -25,15 +26,38 @@ def celery_exe(*args):
     return ' '.join((CELERY_EXE,) + args)
 
 
+#: Format abbreviations expanded in node names,
+#: see :func:`celery.utils.nodenames.host_format`.
+NODE_NAME_FORMAT_CHARS = 'hndiI'
+
+#: Placeholder used to protect literal percent signs in node names
+#: while format abbreviations are being expanded.
+PERCENT_PLACEHOLDER = '\x00'
+
+#: Matches percent signs not starting a known format abbreviation.
+RE_LITERAL_PERCENT = re.compile(r'%(?![{}])'.format(NODE_NAME_FORMAT_CHARS))
+
+
+def expand_node_name(name):
+    """Expand format abbreviations (e.g. ``%h``) in a node name.
+
+    Percent signs that don't start a known abbreviation are kept
+    as-is, so node names like ``foo%bar@host`` don't crash the
+    format expansion.
+    """
+    protected = RE_LITERAL_PERCENT.sub(PERCENT_PLACEHOLDER, name)
+    return host_format(protected).replace(PERCENT_PLACEHOLDER, '%')
+
+
 def build_nodename(name, prefix, suffix):
     hostname = suffix
     if '@' in name:
-        nodename = host_format(name)
+        nodename = expand_node_name(name)
         shortname, hostname = nodesplit(nodename)
         name = shortname
     else:
         shortname = f'{prefix}{name}'
-        nodename = host_format(
+        nodename = expand_node_name(
             f'{shortname}@{hostname}',
         )
     return name, nodename, hostname
@@ -181,7 +205,9 @@ class Node:
         cmd = [' '.join(cmd)]
         argv = tuple(
             cmd +
-            [format_opt(opt, self.expander(value))
+            # the node name (-n) is already fully expanded and must
+            # not be treated as a format string again.
+            [format_opt(opt, value if opt == '-n' else self.expander(value))
              for opt, value in options.items()] +
             [self.extra_args]
         )
