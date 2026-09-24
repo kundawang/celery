@@ -720,8 +720,18 @@ class Backend:
                     request.delivery_info else None,
                 }
                 if getattr(request, 'stamps', None):
-                    request_meta['stamped_headers'] = request.stamped_headers
-                    request_meta.update(request.stamps)
+                    request_meta['stamped_headers'] = (
+                        getattr(request, 'stamped_headers', None) or
+                        list(request.stamps)
+                    )
+                    # Stamps are flattened into the result meta namespace,
+                    # but a stamp must never overwrite the extended
+                    # metadata stored under the same key.
+                    request_meta.update({
+                        header: value
+                        for header, value in request.stamps.items()
+                        if header not in request_meta
+                    })
 
                 if encode:
                     # args and kwargs need to be encoded properly before saving
@@ -731,7 +741,11 @@ class Backend:
                         encoded_value = self.encode(value)
                         request_meta[field] = ensure_bytes(encoded_value)
 
-                meta.update(request_meta)
+                # Reserved meta keys (status, result, ...) take precedence
+                # over flattened stamping metadata sharing the same key.
+                for key, value in request_meta.items():
+                    if key not in meta:
+                        meta[key] = value
 
         return meta
 
