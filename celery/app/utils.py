@@ -357,6 +357,20 @@ def sanitize_url(url, mask='*' * 8):
             return f'{user}:{mask}'
         return uinfo
 
+    def _is_host_only(chunk):
+        """Return True if a separator-delimited chunk without credentials
+        is unambiguously a host (``h2``, ``h2:6379`` or ``[::1]:6379``),
+        not a userinfo fragment of a password containing the separator
+        (``:pa`` or ``user:pa`` from ``redis://:pa;ss@host``)."""
+        if chunk.startswith(':'):
+            return False
+        if chunk.startswith('['):  # IPv6 literal
+            return re.fullmatch(r'\[[0-9A-Fa-f:.]+\](:\d+)?', chunk) is not None
+        if ':' not in chunk:
+            return True
+        _, _, port = chunk.rpartition(':')
+        return port.isdigit()
+
     try:
         if '://' not in url:
             return url
@@ -393,10 +407,33 @@ def sanitize_url(url, mask='*' * 8):
         if server_sep:
             raw_chunks = [c.strip() for c in authority.split(server_sep) if c.strip()]
             if len(raw_chunks) > 1:
-                has_corrupt_chunk = any(c.startswith(':') for c in raw_chunks if '@' not in c)
-                has_at_without_colon = any(':' not in c.rpartition('@')[0] for c in raw_chunks if '@' in c)
-                if not has_corrupt_chunk and not has_at_without_colon:
-                    is_multiserver = True
+                first_chunk = raw_chunks[0]
+                if '@' in first_chunk:
+                    first_uinfo = first_chunk.rpartition('@')[0]
+                    if ':' in first_uinfo:
+                        # Server 1 carries user:password; a later separator
+                        # could still be inside that password
+                        # (e.g. ``u:p@ss;word@host``).  Stay conservative and
+                        # only treat as multi-server when every later
+                        # credentialed chunk has a full user:password pair.
+                        is_multiserver = all(
+                            ':' in c.rpartition('@')[0]
+                            for c in raw_chunks[1:]
+                            if '@' in c
+                        )
+                    else:
+                        # Only a username (no password) before the first
+                        # separator: no secret can span the separator, so
+                        # each chunk is a server of its own.
+                        is_multiserver = True
+                else:
+                    # No credentials before the first separator: multi-server
+                    # only when every credential-less chunk is unambiguously
+                    # a host, not a fragment of a password that contains the
+                    # separator (e.g. ``redis://:pa;ss@host``).
+                    is_multiserver = all(
+                        _is_host_only(c) for c in raw_chunks if '@' not in c
+                    )
 
         if not is_multiserver:
             if authority.count('@') > 1 and ':' not in uinfo:
@@ -418,7 +455,6 @@ def sanitize_url(url, mask='*' * 8):
 
     except Exception:
         if isinstance(url, str) and '@' in url and '://' in url:
-            import re
             return re.sub(r'(://[^:@/]*:)([^@/]*)(@)', r'\g<1>' + mask + r'\3', url)
         return '<unparsable url>'
 
