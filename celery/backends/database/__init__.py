@@ -200,8 +200,15 @@ class DatabaseBackend(BaseBackend):
         if hasattr(task, 'stamps') and 'stamps' in self.task_cls.__table__.columns:
             stamped_headers = meta.get('stamped_headers')
             if stamped_headers:
+                # Stamp values are taken from the request itself: the
+                # result meta namespace is reserved for the result
+                # metadata, so a stamp whose header collides with a
+                # reserved or extended key is not flattened into meta.
+                request_stamps = getattr(request, 'stamps', None) or {}
                 stamps_data = {
-                    h: meta.get(h) for h in stamped_headers if h in meta
+                    h: request_stamps[h] if h in request_stamps else meta[h]
+                    for h in stamped_headers
+                    if h in request_stamps or h in meta
                 }
                 stamps_info = {
                     'stamped_headers': stamped_headers,
@@ -236,7 +243,11 @@ class DatabaseBackend(BaseBackend):
                         if 'stamped_headers' in stamps_info:
                             data['stamped_headers'] = stamps_info['stamped_headers']
                         if 'stamps' in stamps_info and isinstance(stamps_info['stamps'], dict):
-                            data.update(stamps_info['stamps'])
+                            # Column values (extended metadata included)
+                            # take precedence over unpacked stamps
+                            # sharing the same key.
+                            for key, value in stamps_info['stamps'].items():
+                                data.setdefault(key, value)
                 except Exception:
                     pass
             return self.meta_from_decoded(data)

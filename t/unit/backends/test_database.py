@@ -1131,6 +1131,103 @@ class test_DatabaseBackend_result_extended():
             d = task.to_dict()
             assert d['stamps'] is None
 
+    @pytest.mark.parametrize(
+        'result_serializer',
+        ['pickle', 'json'],
+        ids=['using pickle', 'using json']
+    )
+    def test_store_result_stamps_do_not_clobber_extended_metadata(self, result_serializer):
+        # Stamps are flattened into the result meta namespace, but a stamp
+        # whose header is named like an extended result column must not
+        # overwrite the extended metadata stored in that column.
+        self.app.conf.result_serializer = result_serializer
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+
+        stamped_headers = ['name', 'args', 'kwargs', 'worker', 'retries', 'queue']
+        stamps = {header: f'stamped-{header}' for header in stamped_headers}
+        request = Context(args=(1, 2), kwargs={'foo': 'bar'},
+                          task='mytask', retries=2,
+                          hostname='celery@worker_1',
+                          delivery_info={'routing_key': 'celery'},
+                          stamped_headers=stamped_headers,
+                          stamps=stamps)
+
+        tb.store_result(tid, {'fizz': 'buzz'}, states.SUCCESS, request=request)
+        tb._cache.clear()
+        meta = tb.get_task_meta(tid)
+
+        # The extended metadata is preserved in its columns.
+        assert meta['name'] == 'mytask'
+        assert list(meta['args']) == [1, 2]
+        assert meta['kwargs'] == {'foo': 'bar'}
+        assert meta['worker'] == 'celery@worker_1'
+        assert meta['retries'] == 2
+        assert meta['queue'] == 'celery'
+        assert meta['status'] == states.SUCCESS
+        assert meta['result'] == {'fizz': 'buzz'}
+        assert meta['stamped_headers'] == stamped_headers
+
+        # The colliding stamp values are still persisted in the stamps column.
+        session = tb.ResultSession()
+        task = session.query(tb.task_cls).filter(tb.task_cls.task_id == tid).first()
+        stamps_info = tb.decode(task.stamps)
+        session.close()
+        assert stamps_info['stamped_headers'] == stamped_headers
+        assert stamps_info['stamps'] == stamps
+
+    def test_store_result_stamps_do_not_clobber_reserved_meta(self):
+        # A stamp named like a reserved meta key (status, result, ...) must
+        # not corrupt the task state tracked by the backend.
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+
+        stamped_headers = ['status', 'result', 'traceback', 'children', 'date_done']
+        stamps = {header: 'STAMPED' for header in stamped_headers}
+        request = Context(args=(1, 2), kwargs={'foo': 'bar'},
+                          task='mytask', retries=2,
+                          hostname='celery@worker_1',
+                          delivery_info={'routing_key': 'celery'},
+                          stamped_headers=stamped_headers,
+                          stamps=stamps)
+
+        tb.store_result(tid, {'fizz': 'buzz'}, states.SUCCESS, request=request)
+        tb._cache.clear()
+        meta = tb.get_task_meta(tid)
+
+        assert meta['status'] == states.SUCCESS
+        assert meta['result'] == {'fizz': 'buzz'}
+        assert meta['traceback'] is None
+        assert meta['children'] is None
+        assert isinstance(meta['date_done'], datetime)
+        assert meta['stamped_headers'] == stamped_headers
+
+        # The colliding stamp values are still persisted in the stamps column.
+        session = tb.ResultSession()
+        task = session.query(tb.task_cls).filter(tb.task_cls.task_id == tid).first()
+        stamps_info = tb.decode(task.stamps)
+        session.close()
+        assert stamps_info['stamps'] == stamps
+
+    def test_store_result_stamps_without_stamped_headers(self):
+        # A request carrying stamps without an explicit stamped_headers
+        # list still has its stamping metadata written.
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+
+        request = Context(args=(), kwargs={}, task='mytask',
+                          stamps={'stamp1': 'val1', 'stamp2': 'val2'})
+
+        tb.store_result(tid, 'res', states.SUCCESS, request=request)
+        tb._cache.clear()
+        meta = tb.get_task_meta(tid)
+
+        assert meta['result'] == 'res'
+        assert meta['stamp1'] == 'val1'
+        assert meta['stamp2'] == 'val2'
+        assert sorted(meta['stamped_headers']) == ['stamp1', 'stamp2']
+        assert 'stamps' not in meta
+
     def test_query_task_unrelated_database_error_raises(self):
         from sqlalchemy.exc import DatabaseError
         tb = DatabaseBackend(self.uri, app=self.app)

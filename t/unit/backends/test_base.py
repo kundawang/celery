@@ -142,6 +142,43 @@ class test_Backend_interface:
         assert meta['result'] == {'fizz': 'buzz'}
         assert meta['traceback'] is None
 
+    def test_get_result_meta_stamps_do_not_clobber_reserved_or_extended_keys(self):
+        # Stamps are flattened into the result meta namespace, but they
+        # must never overwrite the reserved or extended metadata keys.
+        self.app.conf.result_extended = True
+        b1 = BaseBackend(self.app)
+        request = Context(
+            args=['a', 'b'], kwargs={'foo': 'bar'}, task='mytask',
+            hostname='celery@worker_1', retries=2,
+            delivery_info={'routing_key': 'celery'},
+            stamped_headers=['status', 'result', 'name', 'queue', 'custom'],
+            stamps={'status': 'STAMPED', 'result': 'STAMPED',
+                    'name': 'STAMPED', 'queue': 'STAMPED',
+                    'custom': 'custom-value'},
+        )
+        meta = b1._get_result_meta(result={'fizz': 'buzz'},
+                                   state=states.SUCCESS, traceback=None,
+                                   request=request, encode=False)
+        assert meta['status'] == states.SUCCESS
+        assert meta['result'] == {'fizz': 'buzz'}
+        assert meta['name'] == 'mytask'
+        assert meta['queue'] == 'celery'
+        assert meta['custom'] == 'custom-value'
+        assert meta['stamped_headers'] == [
+            'status', 'result', 'name', 'queue', 'custom']
+
+    def test_get_result_meta_stamps_derive_missing_stamped_headers(self):
+        # A request carrying stamps without an explicit stamped_headers
+        # list still exposes the stamp keys as stamped headers.
+        self.app.conf.result_extended = True
+        b1 = BaseBackend(self.app)
+        request = Context(stamps={'stamp1': 'val1'})
+        meta = b1._get_result_meta(result={'fizz': 'buzz'},
+                                   state=states.SUCCESS, traceback=None,
+                                   request=request, encode=False)
+        assert meta['stamp1'] == 'val1'
+        assert meta['stamped_headers'] == ['stamp1']
+
     def test_get_result_meta_encoded(self):
         self.app.conf.result_extended = True
         b1 = BaseBackend(self.app)
