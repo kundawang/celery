@@ -174,6 +174,50 @@ class test_multi_args:
         assert nodes[0].name == 'worker-1@'
         assert '-c 5' in nodes[0].argv
 
+    def test_parse__name_with_percent_sign(self, tmp_path):
+        p = NamespacedOptionParser([
+            'worker%1', '-c:worker%1', '5',
+            f'--pidfile={tmp_path}/%n.pid',
+            f'--logfile={tmp_path}/%n.log',
+        ])
+        p.parse()
+        nodes = list(multi_args(p, cmd='celery multi', suffix='""'))
+        assert len(nodes) == 1
+        assert nodes[0].name == 'worker%1@'
+        assert '-n worker%1@' in nodes[0].argv
+        assert '-c 5' in nodes[0].argv
+        assert nodes[0].pidfile == f'{tmp_path}/worker%1.pid'
+        assert nodes[0].logfile == f'{tmp_path}/worker%1.log'
+
+    def test_parse__fqdn_name_with_percent_sign(self, tmp_path):
+        p = NamespacedOptionParser([
+            'foo%bar@myhost',
+            f'--pidfile={tmp_path}/%n.pid',
+            f'--logfile={tmp_path}/%n.log',
+        ])
+        p.parse()
+        nodes = list(multi_args(p, cmd='celery multi'))
+        assert len(nodes) == 1
+        assert nodes[0].name == 'foo%bar@myhost'
+        assert '-n foo%bar@myhost' in nodes[0].argv
+        assert nodes[0].pidfile == f'{tmp_path}/foo%bar.pid'
+        assert nodes[0].logfile == f'{tmp_path}/foo%bar.log'
+
+    @patch('celery.utils.nodenames.gethostname')
+    def test_parse__hostname_abbreviation_still_expanded(
+            self, gethostname, tmp_path):
+        gethostname.return_value = 'example.com'
+        p = NamespacedOptionParser([
+            'foo@%h',
+            f'--pidfile={tmp_path}/%n.pid',
+            f'--logfile={tmp_path}/%n.log',
+        ])
+        p.parse()
+        nodes = list(multi_args(p, cmd='celery multi'))
+        assert len(nodes) == 1
+        assert nodes[0].name == 'foo@example.com'
+        assert '-n foo@example.com' in nodes[0].argv
+
     def test_optmerge(self):
         p = NamespacedOptionParser(['foo', 'test'])
         p.parse()
@@ -323,6 +367,15 @@ class test_Node:
 
         mock_exists.assert_any_call('/var/run/demo/celery')
         mock_dirs.assert_any_call('/var/run/demo/celery')
+
+    def test_percent_sign_in_name(self):
+        with patch('celery.apps.multi.os.mkdir'):
+            node = Node('foo%bar@bar.com')
+        assert '-n foo%bar@bar.com' in node.argv
+        assert node.pidfile == os.path.normpath(
+            '/var/run/celery/foo%bar.pid')
+        assert node.logfile == os.path.normpath(
+            '/var/log/celery/foo%bar%I.log')
 
 
 class test_Cluster:

@@ -28,14 +28,16 @@ def celery_exe(*args):
 def build_nodename(name, prefix, suffix):
     hostname = suffix
     if '@' in name:
-        nodename = host_format(name)
-        shortname, hostname = nodesplit(nodename)
+        # Only the hostname part is a format string (e.g. ``foo@%h``);
+        # the node name itself is used literally so that names
+        # containing ``%`` (or any other special character) work.
+        shortname, hostname = nodesplit(name)
+        hostname = host_format(hostname)
+        nodename = f'{shortname}@{hostname}'
         name = shortname
     else:
         shortname = f'{prefix}{name}'
-        nodename = host_format(
-            f'{shortname}@{hostname}',
-        )
+        nodename = f'{shortname}@{host_format(hostname)}'
     return name, nodename, hostname
 
 
@@ -181,7 +183,11 @@ class Node:
         cmd = [' '.join(cmd)]
         argv = tuple(
             cmd +
-            [format_opt(opt, self.expander(value))
+            # The node name options hold the already resolved node
+            # name: expanding them again would interpret a literal
+            # ``%`` in the name as a format abbreviation.
+            [format_opt(opt, value if opt in ('-n', '--hostname')
+                        else self.expander(value))
              for opt, value in options.items()] +
             [self.extra_args]
         )
