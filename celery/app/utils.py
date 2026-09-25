@@ -342,6 +342,8 @@ def sanitize_url(url, mask='*' * 8):
     - Standard single-server URLs (e.g. ``redis://:secret@localhost:6379/0``)
     - Passwords containing separators such as semicolons or commas
     - Multi-server URLs with shared scheme (e.g. ``cache+memcached://user:secret@s1:11211;s2:11211/``)
+    - Multi-server URLs mixing credentialed and credential-less servers
+      (e.g. ``redis://user:secret@s1:6379;user@s2:6379/0``)
     - Redis Sentinel multi-node URLs (e.g. ``sentinel://:secret@h1:26379;sentinel://:secret@h2:26379/0``
       or ``sentinel://:secret@h1:26379;h2:26379/0``)
     - URLs with query strings containing semicolons (e.g. ``redis://user:secret@localhost:6379?a=1;b=2``)
@@ -356,6 +358,34 @@ def sanitize_url(url, mask='*' * 8):
             user, _, _ = uinfo.partition(':')
             return f'{user}:{mask}'
         return uinfo
+
+    def _is_host_only(chunk):
+        """Return True if a separator-delimited chunk without credentials
+        is unambiguously a host (``h2``, ``h2:6379`` or ``[::1]:6379``),
+        not a userinfo fragment of a password containing the separator
+        (``:pa`` or ``user:pa`` from ``redis://:pa;ss@host``)."""
+        if chunk.startswith(':'):
+            return False
+        if chunk.startswith('['):  # IPv6 literal
+            return re.fullmatch(r'\[[0-9A-Fa-f:.]+\](:\d+)?', chunk) is not None
+        if ':' not in chunk:
+            return True
+        _, _, port = chunk.rpartition(':')
+        return port.isdigit()
+
+    def _is_server_chunk(chunk):
+        """Return True if a separator-delimited chunk is a plausible server
+        of a multi-server URL (``host``, ``host:port``, ``user@host`` or
+        ``user:pass@host``), not a fragment of a single-server password
+        that happens to contain the separator."""
+        if chunk.count('@') > 1:
+            # The separator split inside a password containing '@'
+            # (e.g. ``user:p,a@ss@host``).
+            return False
+        if '@' in chunk:
+            _, _, host = chunk.rpartition('@')
+            return bool(host) and _is_host_only(host)
+        return _is_host_only(chunk)
 
     try:
         if '://' not in url:
@@ -393,10 +423,7 @@ def sanitize_url(url, mask='*' * 8):
         if server_sep:
             raw_chunks = [c.strip() for c in authority.split(server_sep) if c.strip()]
             if len(raw_chunks) > 1:
-                has_corrupt_chunk = any(c.startswith(':') for c in raw_chunks if '@' not in c)
-                has_at_without_colon = any(':' not in c.rpartition('@')[0] for c in raw_chunks if '@' in c)
-                if not has_corrupt_chunk and not has_at_without_colon:
-                    is_multiserver = True
+                is_multiserver = all(_is_server_chunk(c) for c in raw_chunks)
 
         if not is_multiserver:
             if authority.count('@') > 1 and ':' not in uinfo:
@@ -418,7 +445,6 @@ def sanitize_url(url, mask='*' * 8):
 
     except Exception:
         if isinstance(url, str) and '@' in url and '://' in url:
-            import re
             return re.sub(r'(://[^:@/]*:)([^@/]*)(@)', r'\g<1>' + mask + r'\3', url)
         return '<unparsable url>'
 

@@ -208,6 +208,66 @@ class test_sanitize_url:
         expected = 'cache+memcached://172.19.26.240:11211;172.19.26.242:11211/'
         assert sanitize_url(url) == expected
 
+    def test_multiserver_username_only_no_password(self):
+        # No password anywhere: nothing may be masked.
+        url = 'redis://user@host1:6379;user@host2:6379/0'
+        assert sanitize_url(url) == url
+
+        url = 'cache+memcached://user@172.19.26.240:11211;user@172.19.26.242:11211/'
+        assert sanitize_url(url) == url
+
+    def test_multiserver_username_only_on_first_server(self):
+        url = 'redis://user@host1:6379;user:secret@host2:6379/0'
+        expected = 'redis://user@host1:6379;user:********@host2:6379/0'
+        assert sanitize_url(url) == expected
+
+    def test_multiserver_password_first_username_only_later(self):
+        url = 'redis://user:secret@host1:6379;user@host2:6379/0'
+        expected = 'redis://user:********@host1:6379;user@host2:6379/0'
+        sanitized = sanitize_url(url)
+        assert sanitized == expected
+        assert 'secret' not in sanitized
+        assert 'host1' in sanitized
+
+    def test_multiserver_mixed_credentialed_and_plain_servers(self):
+        url = 'redis://user:secret@h1:6379;h2:6379;user@h3:6379/0'
+        expected = 'redis://user:********@h1:6379;h2:6379;user@h3:6379/0'
+        sanitized = sanitize_url(url)
+        assert sanitized == expected
+        assert 'secret' not in sanitized
+
+    def test_multiserver_no_credentials_on_first_server(self):
+        url = 'redis://host1:6379;user@host2:6379/0'
+        assert sanitize_url(url) == url
+
+        url = 'redis://host1:6379;user:secret@host2:6379/0'
+        expected = 'redis://host1:6379;user:********@host2:6379/0'
+        assert sanitize_url(url) == expected
+
+        url = 'redis://host1;host2;user@host3/0'
+        assert sanitize_url(url) == url
+
+    def test_multiserver_ipv6_hosts(self):
+        url = 'redis://[::1]:6379;user:secret@[::2]:6379/0'
+        expected = 'redis://[::1]:6379;user:********@[::2]:6379/0'
+        assert sanitize_url(url) == expected
+
+    def test_password_containing_separator_still_masked(self):
+        # A credential-less chunk that is not host:port shaped means the
+        # separator lives inside the password: keep failing closed.
+        url = 'redis://user:pa;ss@host:6379/0'
+        sanitized = sanitize_url(url)
+        assert sanitized == 'redis://user:********@host:6379/0'
+        assert 'pa;ss' not in sanitized
+
+        url = 'redis://:pa;ss@host:6379/0'
+        assert sanitize_url(url) == 'redis://:********@host:6379/0'
+
+        url = 'redis://user:pa;ss:word@host:6379/0'
+        sanitized = sanitize_url(url)
+        assert sanitized == 'redis://user:********@host:6379/0'
+        assert 'pa' not in sanitized
+
     def test_sentinel_multiserver_passwords(self):
         url = 'sentinel://:secret1@h1:26379;sentinel://:secret2@h2:26379/0'
         expected = 'sentinel://:********@h1:26379;sentinel://:********@h2:26379/0'
