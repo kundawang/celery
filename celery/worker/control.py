@@ -233,9 +233,25 @@ def _revoke(state, task_ids, terminate=False, signal=None, **kwargs):
                 # The task already has a result (or the chord error handler
                 # failed it on its behalf); a revoke must not overwrite it.
                 continue
-            backend.mark_as_revoked(task_id, reason='revoked', store_result=True)
+            if request is not None:
+                # Pass the locally-known request so the backend can run
+                # chord bookkeeping for the revoked member; tasks unknown
+                # to this worker behave like before.
+                backend.mark_as_revoked(
+                    task_id, reason='revoked', store_result=True,
+                    request=request)
+            else:
+                backend.mark_as_revoked(
+                    task_id, reason='revoked', store_result=True)
         except Exception as exc:
             logger.warning('Failed to mark task %s as revoked in backend: %s', task_id, exc)
+        else:
+            if request is not None:
+                # The backend stored the REVOKED state and ran the chord
+                # bookkeeping. Flag the request so the announce that runs
+                # when the worker later discards it does not count the
+                # chord member a second time.
+                request._revoked_in_backend = True
 
     if terminate:
         signum = _signals.signum(signal or TERM_SIGNAME)

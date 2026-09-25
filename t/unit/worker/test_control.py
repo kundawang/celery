@@ -711,14 +711,34 @@ class test_ControlPanel:
                 control.revoke(state, tid)
                 control.revoke(state, tid)
             assert task_backend.mark_as_revoked.call_count == 2
-            task_backend.mark_as_revoked.assert_called_with(tid, reason='revoked', store_result=True)
+            task_backend.mark_as_revoked.assert_called_with(
+                tid, reason='revoked', store_result=True, request=request)
             mar.assert_not_called()
         finally:
             worker_state.task_ready(request)
             revoked.discard(tid)
 
+    def test_revoke_unknown_task_gets_no_request(self):
+        # Tasks unknown to this worker are revoked through the app backend
+        # without a request, behaving like before.
+        tid = uuid()
+        state = self.create_state()
+        state.consumer = Mock()
+        try:
+            with patch.object(state.app.backend, 'mark_as_revoked') as mar:
+                control.revoke(state, tid)
+            mar.assert_called_once_with(
+                tid, reason='revoked', store_result=True)
+            assert tid in revoked
+        finally:
+            revoked.discard(tid)
+
     @pytest.mark.parametrize('revoke_count', [1, 2])
-    def test_revoke_chord_member_is_counted_once_on_discard(self, revoke_count):
+    def test_revoke_reserved_chord_member_is_counted_once(self, revoke_count):
+        # Revoking a reserved chord member through the control command must
+        # run the chord bookkeeping right away, and neither repeating the
+        # control command nor the worker discarding the request later may
+        # count the member again.
         backend = self.app.backend
         task_id, group_id = uuid(), uuid()
         body = self.mytask.s()
@@ -738,17 +758,81 @@ class test_ControlPanel:
             for _ in range(revoke_count):
                 control.revoke(state, task_id)
                 assert backend.get_task_meta(task_id)['status'] == states.REVOKED
-                # Control revokes store the state but leave chord bookkeeping
-                # to the request's discard/announce path, even when repeated.
-                assert int(backend.get(counter_key)) == 0
+                # The control revoke runs the chord bookkeeping immediately;
+                # repeating it must not count the member again.
+                assert int(backend.get(counter_key)) == 1
 
+            # The worker discarding the revoked request later must not count
+            # the chord member a second time either.
             assert request.revoked()
             assert request.acknowledged
             assert int(backend.get(counter_key)) == 1
+        finally:
+            worker_state.task_ready(request)
+            revoked.discard(task_id)
 
-            # Neither another control revoke nor another discard check may
-            # count the same chord member again.
+    def test_revoke_reserved_chord_member_completes_chord(self):
+        # When the revoked reserved member is the last one the chord waits
+        # on, the bookkeeping runs at revoke time and the chord finishes
+        # instead of hanging.
+        backend = self.app.backend
+        task_id, group_id = uuid(), uuid()
+        body = self.mytask.s()
+        message = self.TaskMessage(self.mytask.name, task_id, group=group_id)
+        message.payload[2]['chord'] = body
+        request = Request(message, app=self.app)
+
+        other_id = uuid()
+        results = [self.app.AsyncResult(task_id),
+                   self.app.AsyncResult(other_id)]
+        backend.apply_chord((group_id, results), body)
+        counter_key = backend.get_key_for_chord(group_id)
+        # The other member already returned; only the revoked member is
+        # still missing.
+        other_message = self.TaskMessage(self.mytask.name, other_id,
+                                         group=group_id)
+        other_message.payload[2]['chord'] = body
+        other_request = Request(other_message, app=self.app)
+        backend.mark_as_done(other_id, 42, request=other_request._context)
+        assert int(backend.get(counter_key)) == 1
+
+        state = self.create_state()
+        worker_state.task_reserved(request)
+        try:
             control.revoke(state, task_id)
+            assert backend.get_task_meta(task_id)['status'] == states.REVOKED
+            # The chord reached its size at revoke time and was finalized:
+            # the counter is gone instead of waiting on the member forever.
+            assert backend.get(counter_key) is None
+        finally:
+            worker_state.task_ready(request)
+            revoked.discard(task_id)
+
+    def test_revoke_chord_member_backend_error_retries_on_discard(self):
+        # If storing the revoked state fails, the request must stay
+        # unflagged so the discard announce retries the chord bookkeeping
+        # instead of skipping it.
+        backend = self.app.backend
+        task_id, group_id = uuid(), uuid()
+        body = self.mytask.s()
+        message = self.TaskMessage(self.mytask.name, task_id, group=group_id)
+        message.payload[2]['chord'] = body
+        request = Request(message, app=self.app)
+
+        results = [self.app.AsyncResult(task_id),
+                   self.app.AsyncResult(uuid()), self.app.AsyncResult(uuid())]
+        backend.apply_chord((group_id, results), body)
+        counter_key = backend.get_key_for_chord(group_id)
+        state = self.create_state()
+        worker_state.task_reserved(request)
+        try:
+            with patch.object(
+                backend, 'mark_as_revoked', side_effect=KeyError('boom')
+            ):
+                control.revoke(state, task_id)
+            assert not request._revoked_in_backend
+            assert int(backend.get(counter_key)) == 0
+
             assert request.revoked()
             assert int(backend.get(counter_key)) == 1
         finally:

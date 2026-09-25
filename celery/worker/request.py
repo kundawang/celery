@@ -73,6 +73,7 @@ class Request:
     time_limits = (None, None)
     _already_revoked = False
     _already_cancelled = False
+    _revoked_in_backend = False
     _terminate_on_ack = None
     _apply_result = None
     _tzlocal = None
@@ -464,10 +465,15 @@ class Request:
         task_ready(self)
         self.send_event('task-revoked',
                         terminated=terminated, signum=signum, expired=expired)
-        self.task.backend.mark_as_revoked(
-            self.id, reason, request=self._context,
-            store_result=self.store_errors,
-        )
+        if not self._revoked_in_backend:
+            # The control revoke command may have already stored the
+            # REVOKED state and run the chord bookkeeping for this
+            # request; reporting it again would count the chord member
+            # twice.
+            self.task.backend.mark_as_revoked(
+                self.id, reason, request=self._context,
+                store_result=self.store_errors,
+            )
         self.acknowledge()
         self._already_revoked = True
         send_revoked(self.task, request=self._context,
