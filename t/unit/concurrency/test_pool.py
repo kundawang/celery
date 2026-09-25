@@ -1,10 +1,23 @@
 import itertools
 import time
+from unittest.mock import Mock, patch
 
 import pytest
 from billiard.einfo import ExceptionInfo
 
+from celery.concurrency.base import firing_hub_timers
+
 pytest.importorskip('multiprocessing')
+
+
+def wait_for(condition, timeout=5.0):
+    """Poll condition() until true or the timeout expires."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.01)
+    return condition()
 
 
 def do_something(i):
@@ -70,3 +83,51 @@ class test_TaskPool:
         time.sleep(0.5)
         assert scratchpad.get(3)['ret_value'] == 900
         p.stop()
+
+
+class test_firing_hub_timers:
+
+    def test_no_hub_is_noop(self):
+        with patch('celery.concurrency.base.get_event_loop',
+                   return_value=None), \
+                patch('celery.concurrency.base.Thread') as mock_thread:
+            with firing_hub_timers():
+                pass
+        mock_thread.assert_not_called()
+
+    def test_fires_timers_while_blocked(self):
+        hub = Mock(name='hub')
+        with patch('celery.concurrency.base.get_event_loop',
+                   return_value=hub):
+            with firing_hub_timers(interval=0.01):
+                assert wait_for(lambda: hub.fire_timers.call_count >= 2)
+        assert hub.fire_timers.call_count >= 2
+
+    def test_stops_firing_after_exit(self):
+        hub = Mock(name='hub')
+        with patch('celery.concurrency.base.get_event_loop',
+                   return_value=hub):
+            with firing_hub_timers(interval=0.01):
+                assert wait_for(lambda: hub.fire_timers.call_count >= 1)
+            # the timer thread is joined on exit, so no more timers fire.
+            call_count = hub.fire_timers.call_count
+            time.sleep(0.1)
+            assert hub.fire_timers.call_count == call_count
+
+    def test_fire_timers_exception_does_not_break_the_loop(self):
+        hub = Mock(name='hub')
+        hub.fire_timers.side_effect = [Exception('boom'), None, None]
+        with patch('celery.concurrency.base.get_event_loop',
+                   return_value=hub):
+            with firing_hub_timers(interval=0.01):
+                assert wait_for(lambda: hub.fire_timers.call_count >= 3)
+
+    def test_keeps_firing_while_long_task_drains(self):
+        # Simulates shutdown waiting for a long-running task: the broker
+        # heartbeat timers must keep firing for the whole drain.
+        hub = Mock(name='hub')
+        with patch('celery.concurrency.base.get_event_loop',
+                   return_value=hub):
+            with firing_hub_timers(interval=0.1):
+                time.sleep(0.55)  # long task still running
+            assert hub.fire_timers.call_count >= 2

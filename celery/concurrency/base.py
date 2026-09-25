@@ -3,10 +3,13 @@ import logging
 import os
 import sys
 import time
+from contextlib import contextmanager
+from threading import Event, Thread
 from typing import Any, Dict
 
 from billiard.einfo import ExceptionInfo
 from billiard.exceptions import WorkerLostError
+from kombu.asynchronous import get_event_loop
 from kombu.utils.encoding import safe_repr
 
 from celery.exceptions import WorkerShutdown, WorkerTerminate, reraise
@@ -14,9 +17,60 @@ from celery.utils import timer2
 from celery.utils.log import get_logger
 from celery.utils.text import truncate
 
-__all__ = ('BasePool', 'apply_target')
+__all__ = ('BasePool', 'apply_target', 'firing_hub_timers')
 
 logger = get_logger('celery.pool')
+
+
+@contextmanager
+def firing_hub_timers(interval=0.5):
+    """Keep event-loop timers firing while the calling thread is blocked.
+
+    During shutdown the consumer event loop has already exited, but the
+    worker may still be draining (waiting for long-running tasks to finish
+    or sleeping out the soft-shutdown timeout).  Broker heartbeats are
+    driven by timers on the kombu hub, so if nothing fires them the broker
+    closes the connection for inactivity and pending results/acks can no
+    longer be sent.  This context manager fires the hub timers from a
+    daemon thread until the blocked section completes.
+
+    If no event loop (hub) is in use there is nothing to fire and the
+    context manager is a no-op.
+    """
+    hub = get_event_loop()
+    if hub is None:
+        yield
+        return
+
+    shutdown_event = Event()
+
+    def fire_timers_loop():
+        while not shutdown_event.is_set():
+            try:
+                hub.fire_timers()
+            except Exception:
+                logger.warning(
+                    'Exception in timer thread while draining',
+                    exc_info=True,
+                )
+            # Wake up promptly when the drain is done; the interval only
+            # bounds how long we sleep between firing the timers.
+            shutdown_event.wait(interval)
+
+    timer_thread = Thread(
+        target=fire_timers_loop,
+        daemon=True,
+        name='celery-drain-timers',
+    )
+    timer_thread.start()
+    try:
+        yield
+    finally:
+        shutdown_event.set()
+        timer_thread.join(timeout=1.0)
+        if timer_thread.is_alive():
+            logger.warning(
+                'Timer thread did not terminate cleanly while draining')
 
 
 def apply_target(target, args=(), kwargs=None, callback=None,

@@ -4,7 +4,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING, Any, Callable
 
-from .base import BasePool, apply_target
+from .base import BasePool, apply_target, firing_hub_timers
 
 __all__ = ('TaskPool',)
 
@@ -39,7 +39,10 @@ class TaskPool(BasePool):
         self.executor = ThreadPoolExecutor(max_workers=self.limit)
 
     def on_stop(self) -> None:
-        self.executor.shutdown(cancel_futures=True)
+        # Keep firing timers (for heartbeats on async transports) while
+        # running tasks drain. If no event loop is in use this is a no-op.
+        with firing_hub_timers():
+            self.executor.shutdown(cancel_futures=True)
         super().on_stop()
 
     def on_apply(

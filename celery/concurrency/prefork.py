@@ -3,20 +3,17 @@
 Pool implementation using :mod:`multiprocessing`.
 """
 import os
-import threading
-import time
 
 from billiard import forking_enable, get_start_method, set_start_method
 from billiard.common import REMAP_SIGTERM, TERM_SIGNAME
 from billiard.pool import CLOSE, RUN
 from billiard.pool import Pool as BlockingPool
-from kombu.asynchronous import get_event_loop
 
 from celery import platforms, signals
 from celery._state import _set_task_join_will_block, set_default_app
 from celery.app import base as _app_base
 from celery.app import trace
-from celery.concurrency.base import BasePool
+from celery.concurrency.base import BasePool, firing_hub_timers
 from celery.utils.functional import noop
 from celery.utils.log import get_logger
 
@@ -173,43 +170,8 @@ class TaskPool(BasePool):
 
             # Keep firing timers (for heartbeats on async transports) while
             # the pool drains. If not using an async transport, no hub exists
-            # and the timer thread is not created.
-            hub = get_event_loop()
-            if hub is not None:
-                shutdown_event = threading.Event()
-
-                def fire_timers_loop():
-                    while not shutdown_event.is_set():
-                        try:
-                            hub.fire_timers()
-                        except Exception:
-                            logger.warning(
-                                "Exception in timer thread during prefork on_stop()",
-                                exc_info=True,
-                            )
-                        # 0.5 seconds was chosen as a balance between joining quickly
-                        # after the pool join is complete and sleeping long enough to
-                        # avoid excessive CPU usage.
-                        time.sleep(0.5)
-
-                timer_thread = threading.Thread(
-                    target=fire_timers_loop,
-                    daemon=True,
-                    name="prefork-timer-shutdown",
-                )
-                timer_thread.start()
-
-                try:
-                    self._pool.join()
-                finally:
-                    shutdown_event.set()
-                    timer_thread.join(timeout=1.0)
-
-                    if timer_thread.is_alive():
-                        logger.warning(
-                            "Timer thread in prefork on_stop() did not terminate cleanly"
-                        )
-            else:
+            # and no timer thread is started.
+            with firing_hub_timers():
                 self._pool.join()
 
             self._pool = None

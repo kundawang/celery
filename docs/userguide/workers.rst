@@ -133,6 +133,11 @@ and will call :func:`WorkController.stop() <celery.worker.worker.WorkController.
     able to complete before the worker terminates.
 
 .. versionchanged:: 5.7
+    Broker heartbeats are now maintained during the whole drain phase of a shutdown, not only for the prefork
+    pool: the thread pool keeps sending heartbeats while running tasks finish, and heartbeats are also kept
+    alive while waiting out the :setting:`worker_soft_shutdown_timeout` on the cold shutdown path.
+
+.. versionchanged:: 5.7
     When using the thread pool (``--pool threads``), pending futures are now cancelled during warm shutdown
     using ``cancel_futures=True``. Previously, the thread pool would wait for all submitted tasks to complete,
     including those that had not yet started executing. This change ensures that only currently running tasks

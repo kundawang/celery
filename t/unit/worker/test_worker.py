@@ -1369,6 +1369,20 @@ class test_WorkController(ConsumerCase):
             worker.wait_for_soft_shutdown()
             sleep.assert_called_with(worker.app.conf.worker_soft_shutdown_timeout)
 
+    def test_wait_for_soft_shutdown_fires_hub_timers(self):
+        # The soft-shutdown wait runs with the event loop stopped, so hub
+        # timers (broker heartbeats) must be fired from a separate thread
+        # to keep the broker connection alive while tasks drain.
+        worker = self.worker
+        worker.app.conf.worker_soft_shutdown_timeout = 10
+        request = Mock(name='task', id='1234213')
+        state.task_accepted(request)
+        with patch("celery.worker.worker.sleep") as sleep, \
+                patch("celery.worker.worker.firing_hub_timers") as firing:
+            worker.wait_for_soft_shutdown()
+            firing.assert_called_once_with()
+            sleep.assert_called_with(worker.app.conf.worker_soft_shutdown_timeout)
+
     def test_wait_for_soft_shutdown_no_tasks(self):
         worker = self.worker
         worker.app.conf.worker_soft_shutdown_timeout = 10

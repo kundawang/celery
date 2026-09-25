@@ -24,6 +24,7 @@ from celery import bootsteps
 from celery import concurrency as _concurrency
 from celery import signals
 from celery.bootsteps import RUN, TERMINATE
+from celery.concurrency.base import firing_hub_timers
 from celery.exceptions import ImproperlyConfigured, TaskRevokedError, WorkerTerminate
 from celery.platforms import EX_FAILURE, create_pidlock
 from celery.utils.imports import reload_from_cwd
@@ -453,4 +454,9 @@ class WorkController:
         if app.conf.worker_soft_shutdown_timeout > 0 and requests:
             log = f"Initiating Soft Shutdown, terminating in {app.conf.worker_soft_shutdown_timeout} seconds"
             logger.warning(log)
-            sleep(app.conf.worker_soft_shutdown_timeout)
+            # This sleep runs with the event loop already stopped (cold
+            # shutdown path), so keep firing hub timers to prevent the
+            # broker from closing the connection for missed heartbeats
+            # while we wait for tasks to finish.
+            with firing_hub_timers():
+                sleep(app.conf.worker_soft_shutdown_timeout)
