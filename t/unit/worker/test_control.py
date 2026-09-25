@@ -711,14 +711,44 @@ class test_ControlPanel:
                 control.revoke(state, tid)
                 control.revoke(state, tid)
             assert task_backend.mark_as_revoked.call_count == 2
-            task_backend.mark_as_revoked.assert_called_with(tid, reason='revoked', store_result=True)
+            task_backend.mark_as_revoked.assert_called_with(
+                tid, reason='revoked', store_result=True, request=request)
             mar.assert_not_called()
         finally:
             worker_state.task_ready(request)
             revoked.discard(tid)
 
+    def test_revoke_reserved_chord_member_completes_chord(self):
+        # Revoking a reserved chord member through the control command must
+        # run the chord bookkeeping so the chord finishes instead of waiting
+        # forever for the member that will never execute.
+        backend = self.app.backend
+        task_id, group_id = uuid(), uuid()
+        body = self.mytask.s()
+        body_id = body.options['task_id'] = uuid()
+        message = self.TaskMessage(self.mytask.name, task_id, group=group_id)
+        message.payload[2]['chord'] = body
+        request = Request(message, app=self.app)
+
+        # The revoked member is the only one the chord still waits for.
+        results = [self.app.AsyncResult(task_id)]
+        backend.apply_chord((group_id, results), body)
+        counter_key = backend.get_key_for_chord(group_id)
+        state = self.create_state()
+        worker_state.task_reserved(request)
+        try:
+            control.revoke(state, task_id)
+            assert backend.get_task_meta(task_id)['status'] == states.REVOKED
+            # The chord unlocked: its counter is gone and the body result
+            # reached a terminal state instead of hanging.
+            assert backend.get(counter_key) is None
+            assert self.app.AsyncResult(body_id).state == states.FAILURE
+        finally:
+            worker_state.task_ready(request)
+            revoked.discard(task_id)
+
     @pytest.mark.parametrize('revoke_count', [1, 2])
-    def test_revoke_chord_member_is_counted_once_on_discard(self, revoke_count):
+    def test_revoke_chord_member_is_counted_once(self, revoke_count):
         backend = self.app.backend
         task_id, group_id = uuid(), uuid()
         body = self.mytask.s()
@@ -738,22 +768,37 @@ class test_ControlPanel:
             for _ in range(revoke_count):
                 control.revoke(state, task_id)
                 assert backend.get_task_meta(task_id)['status'] == states.REVOKED
-                # Control revokes store the state but leave chord bookkeeping
-                # to the request's discard/announce path, even when repeated.
-                assert int(backend.get(counter_key)) == 0
+                # The control revoke runs the chord bookkeeping immediately;
+                # repeating it must not count the member again.
+                assert int(backend.get(counter_key)) == 1
 
+            # The discard/announce path must not count the member again
+            # either, even though it still acknowledges the message.
             assert request.revoked()
             assert request.acknowledged
             assert int(backend.get(counter_key)) == 1
 
-            # Neither another control revoke nor another discard check may
-            # count the same chord member again.
             control.revoke(state, task_id)
             assert request.revoked()
             assert int(backend.get(counter_key)) == 1
         finally:
             worker_state.task_ready(request)
             revoked.discard(task_id)
+
+    def test_revoke_unknown_task_id_behaves_as_before(self):
+        # A task id unknown to this worker gets no request and is only
+        # flagged as revoked, exactly like before the chord bookkeeping fix.
+        tid = uuid()
+        state = self.create_state()
+        state.consumer = Mock()
+        try:
+            with patch.object(state.app.backend, 'mark_as_revoked') as mar:
+                control.revoke(state, tid)
+            mar.assert_called_once_with(
+                tid, reason='revoked', store_result=True, request=None)
+            assert tid in revoked
+        finally:
+            revoked.discard(tid)
 
     def test_revoke_skips_active_request_without_terminate(self):
         request = Mock()
@@ -1094,8 +1139,10 @@ class test_ControlPanel:
 
         assert self.app.backend.mark_as_revoked.call_count == 2
         calls = self.app.backend.mark_as_revoked.call_args_list
-        assert calls[0] == (('task-1',), {'reason': 'revoked', 'store_result': True})
-        assert calls[1] == (('task-2',), {'reason': 'revoked', 'store_result': True})
+        assert calls[0] == (('task-1',), {'reason': 'revoked', 'store_result': True,
+                                          'request': None})
+        assert calls[1] == (('task-2',), {'reason': 'revoked', 'store_result': True,
+                                          'request': None})
 
     @pytest.mark.parametrize('ready_state', sorted(states.READY_STATES))
     def test_revoke_keeps_finished_result(self, ready_state):
@@ -1111,7 +1158,7 @@ class test_ControlPanel:
             assert 'task-1' in worker_state.revoked
             assert 'task-2' in worker_state.revoked
             self.app.backend.mark_as_revoked.assert_called_once_with(
-                'task-2', reason='revoked', store_result=True)
+                'task-2', reason='revoked', store_result=True, request=None)
 
     @pytest.mark.parametrize('unready_state', sorted(states.UNREADY_STATES))
     def test_revoke_marks_unfinished_task(self, unready_state):
@@ -1122,7 +1169,7 @@ class test_ControlPanel:
             control._revoke(state, ['task-1'])
 
             self.app.backend.mark_as_revoked.assert_called_once_with(
-                'task-1', reason='revoked', store_result=True)
+                'task-1', reason='revoked', store_result=True, request=None)
 
     @patch('celery.Celery.backend', new=PropertyMock(name='backend'))
     def test_revoke_state_lookup_failure_defensive(self):
@@ -1150,7 +1197,7 @@ class test_ControlPanel:
             control._revoke(state, ['task-1'], terminate=True)
 
         self.app.backend.mark_as_revoked.assert_called_once_with(
-            'task-1', reason='revoked', store_result=True
+            'task-1', reason='revoked', store_result=True, request=None
         )
 
     def test_revoke_by_stamped_headers_terminates_matching_request(self):
