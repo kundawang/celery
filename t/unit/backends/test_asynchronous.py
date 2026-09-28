@@ -1,4 +1,3 @@
-import logging
 import os
 import socket
 import sys
@@ -154,8 +153,13 @@ class test_Drainer_without_greenlets:
 
     # -- drain_events_until: OSError from wait ------------------------------
 
-    def test_drain_catches_oserror_and_logs(self, app):
-        """OSError from wait() must be caught, logged, loop continues."""
+    def test_drain_propagates_oserror(self, app):
+        """OSError from wait() must propagate instead of looping forever.
+
+        Connection recovery happens inside drain_events (reconnect_on_error);
+        an OSError escaping it is unrecoverable and must reach the caller,
+        otherwise drain_events_until would spin until manual restart.
+        """
         consumer = _make_consumer(app)
         drainer = consumer.drainer
         p = promise()
@@ -163,17 +167,14 @@ class test_Drainer_without_greenlets:
 
         def wait(timeout=None):
             calls[0] += 1
-            if calls[0] <= 2:
-                raise OSError('broker away')
-            p('done')
+            raise OSError('broker away')
 
-        with patch.object(logging, 'warning') as mock_warn:
+        with pytest.raises(OSError, match='broker away'):
             for _ in drainer.drain_events_until(
                     p, wait=wait, interval=0.01, timeout=5):
                 pass
 
-        assert p.ready
-        assert mock_warn.call_count >= 2
+        assert calls[0] == 1
 
     # -- wait_for -----------------------------------------------------------
 
@@ -237,28 +238,32 @@ class test_greenletDrainer:
 
     # -- run: OSError is caught and logged ----------------------------------
 
-    def test_run_catches_oserror_and_logs(self, app):
-        """OSError in run() must be caught/logged, loop continues."""
+    def test_run_stores_and_reraises_oserror(self, app):
+        """OSError in run() must kill the greenlet and be stored in _exc.
+
+        The greenlet must not retry an unrecoverable OSError forever:
+        it exits, sets _shutdown, and _ensure_not_shut_down re-raises
+        the error in the waiting thread (no infinite loop).
+        """
         drainer = self._make_greenlet_drainer(app)
         calls = [0]
 
         def drain(timeout=None):
             calls[0] += 1
-            if calls[0] <= 3:
-                raise OSError('connection reset')
-            drainer._stopped.set()
+            raise OSError('connection reset')
 
         drainer.result_consumer.drain_events = Mock(side_effect=drain)
 
-        with patch.object(logging, 'warning') as mock_warn, \
-                patch('celery.backends.asynchronous.time.sleep') as mock_sleep:
+        with pytest.raises(OSError, match='connection reset'):
             drainer.run()
 
-        assert calls[0] >= 4
-        assert mock_warn.call_count >= 3
-        # backoff sleep should have been called once per OSError
-        assert mock_sleep.call_count >= 3
-        assert drainer._exc is None
+        assert calls[0] == 1
+        assert isinstance(drainer._exc, OSError)
+        assert drainer._shutdown.is_set()
+
+        # the stored error is re-raised for waiters instead of hanging
+        with pytest.raises(OSError, match='connection reset'):
+            drainer._ensure_not_shut_down()
 
     # -- run: unexpected Exception is stored and re-raised ------------------
 
@@ -511,24 +516,27 @@ class GreenletDrainerTests(DrainerTests):
 
             self.teardown_thread(thread)
 
-    def test_run_catches_and_logs_oserror(self):
-        def flaky(*args, **kwargs):
-            if not hasattr(flaky, '_raised'):
-                flaky._raised = True
-                raise OSError('simulated broker restart in greenlet')
-            self.drainer._stopped.set()
+    def test_drain_raises_oserror_when_greenlet_exits(self):
+        """A persistent OSError must propagate out of drain_events_until.
 
+        Regression test: the drainer greenlet must exit and report the
+        error instead of retrying forever while the caller waits on a
+        _drain_complete_event that is never set again (infinite loop
+        requiring manual restart).
+        """
         with patch.object(
             self.drainer.result_consumer, 'drain_events',
-            side_effect=flaky,
+            side_effect=OSError('simulated broker failure in greenlet'),
         ):
-            with patch('logging.warning') as mock_warn:
-                t = self.schedule_thread(self.drainer.run)
-                self.teardown_thread(t)
+            with pytest.raises(OSError, match='simulated broker failure'):
+                p = promise()
 
-        assert mock_warn.called
-        assert 'connection error during drain_events' in mock_warn.call_args[0][0]
-        assert self.drainer._exc is None
+                for _ in self.drainer.drain_events_until(
+                        p, interval=self.interval, timeout=self.MAX_TIMEOUT):
+                    pass
+
+        assert self.drainer._shutdown.is_set()
+        assert isinstance(self.drainer._exc, OSError)
 
 
 @pytest.mark.skipif(
@@ -590,22 +598,16 @@ class test_Drainer(DrainerTests):
     def teardown_thread(self, thread):
         thread.join()
 
-    def test_drain_catches_and_logs_oserror(self):
+    def test_drain_propagates_oserror(self):
         result = promise()
         calls = 0
 
         def wait(timeout=None):
             nonlocal calls
             calls += 1
-            if calls == 1:
-                raise OSError('simulated broker restart')
-            result('done')
+            raise OSError('simulated broker failure')
 
-        with patch(
-            'celery.backends.asynchronous.logging.warning',
-        ) as mock_warn, patch(
-            'celery.backends.asynchronous.time.sleep',
-        ) as mock_sleep:
+        with pytest.raises(OSError, match='simulated broker failure'):
             list(self.drainer.drain_events_until(
                 result,
                 wait=wait,
@@ -613,10 +615,8 @@ class test_Drainer(DrainerTests):
                 timeout=1,
             ))
 
-        assert result.ready
-        mock_warn.assert_called_once()
-        assert 'connection error during drain_events' in mock_warn.call_args.args[0]
-        mock_sleep.assert_called_once_with(0.01)
+        assert not result.ready
+        assert calls == 1
 
 
 class test_GeventDrainer(GreenletDrainerTests):

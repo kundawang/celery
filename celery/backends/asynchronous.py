@@ -89,17 +89,6 @@ class Drainer:
                 yield self.wait_for(p, wait, timeout=interval)
             except socket.timeout:
                 pass
-            except OSError:
-                # Recoverable connection error (e.g. broker restart).
-                # drain_events handles reconnection internally; if an
-                # OSError still leaks through, we log, sleep for one
-                # interval, and continue rather than spinning hot.
-                logging.warning(
-                    'Drainer: connection error during drain_events, '
-                    'will retry on next loop iteration.',
-                    exc_info=True,
-                )
-                time.sleep(interval)
 
             if on_interval:
                 on_interval()
@@ -139,18 +128,13 @@ class greenletDrainer(Drainer):
                     self._send_drain_complete_event()
                 except socket.timeout:
                     pass
-                except OSError:
-                    # Recoverable connection errors (e.g. broker restart)
-                    # are handled inside drain_events via reconnection.
-                    # If something still leaks through, we log, back off
-                    # briefly, and retry instead of spinning hot.
-                    logging.warning(
-                        'Drainer: connection error during drain_events, '
-                        'will retry on next loop iteration.',
-                        exc_info=True,
-                    )
-                    time.sleep(1)
         except Exception as e:
+            # Any error escaping drain_events (including OSError) is
+            # fatal to the drainer: connection recovery is the job of
+            # drain_events itself (see BaseResultConsumer.reconnect_on_error).
+            # Store it and let the greenlet exit so that waiters are
+            # notified via _ensure_not_shut_down instead of waiting
+            # forever on a drainer that can no longer make progress.
             self._exc = e
             raise
         finally:
